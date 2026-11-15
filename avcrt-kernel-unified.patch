@@ -1,0 +1,231 @@
+# ============================================================================
+# avcrt-kernel-unified.patch  —  THE single AVCRT kernel patch (avicii / lito,
+#                                OnePlus Nord, Android 16, Magisk/KSU).
+# Covers every kernel-side front of the AVCRT real-time voice changer + the
+# build fixes needed to produce a WORKING, camera-OK kernel. Assembled 2026-06-17.
+# Apply from the kernel source root:  patch -p1 < avcrt-kernel-unified.patch
+# (git apply also works). NOTE: components 1 + 3-5 are already baked into the
+# /home/niftox/avcrt/avicii-kernel tree; this file is the complete record. The
+# net-new change of 2026-06-17 is component 2 (AVCRT CVP Rebuild).
+#
+# ---- COMPONENTS ------------------------------------------------------------
+# 1. techpack/audio/asoc/codecs/bolero/tx-macro.c
+#       "AVCRT Dec Mute" — default-off codec kcontrol. Forces the digital MUTE
+#       bit (0x10) in TXn_TX_PATH_CTL for a bitmask of decimators so the avcrtd
+#       daemon can silence the call's modem-bound mic on CODEC mic paths
+#       (built-in + real 3.5mm analog jack) for a clean GSM voice replace.
+#
+# 2. techpack/audio/asoc/msm-pcm-routing-v2.c   *** NEW 2026-06-17 ***
+#       "AVCRT CVP Rebuild" — default-off voice kcontrol. A non-zero write does
+#       voc_disable_device()+voc_enable_device() on every active voice session:
+#       the exact in-kernel vocproc teardown/rebuild the audio HAL runs for an
+#       in-call device switch. It re-sends VSS_IVOCPROC_CMD_SET_DEVICE with the
+#       current Tx port, flushing a stale CVP Tx latch WITHOUT restarting
+#       audioserver. Fixes the mid-call accessory-swap additive bug (notably the
+#       minijack->type-C swap CVP latch) and retires the fragile userspace
+#       "ctl.restart audioserver" hammer + its USB re-enumeration flicker loop.
+#       Iterates VoiceMMode1/2 + VoLTE/Voice/Voice2/VoWLAN -> portable/future.
+#
+# 3. Makefile : default BRAND_SHOW_FLAG=oneplus -> selects
+#       qcom_pm8008-regulator-nord (the rear-camera PM8008 PMIC). Without it the
+#       generic regulator builds and the REAR cameras get no power.
+#
+# 4. scripts/Makefile.lib : add `-f` to cmd_dtc so strict dtc doesn't abort on
+#       lito-mtp-overlay.dtbo (lets `dtbs` / Image.gz-dtb build).
+#
+# 5. kernel/cred.c : EXPORT_SYMBOL(get_task_cred) so a QCA_CLD_WLAN=m wlan.ko
+#       links (NetHunter qcacld). Harmless when WLAN is builtin (=y).
+#
+# ---- NOT INCLUDED (researched 2026-06-17, traced INFEASIBLE) ---------------
+#   A "true" clean replace that keeps the real mic out of the uplink entirely
+#   (AP PCM -> RX-proxy -> voice Tx) is NOT achievable on this signed ADSP:
+#   there is no stock RX->TX route (afe_loopback + afe_sidetone are both TX->RX
+#   / LB_MODE_SIDETONE), the CVP only reads TX ports, the AP only writes RX
+#   ports, and the lone AP->uplink path (incall_music host-PCM) is additive by
+#   firmware design. The CVP Rebuild lever (component 2) instead makes the
+#   existing reroute-based clean replace latch-free on every mic type.
+# ============================================================================
+--- a/techpack/audio/asoc/codecs/bolero/tx-macro.c
++++ b/techpack/audio/asoc/codecs/bolero/tx-macro.c
+@@ -2395,7 +2395,53 @@
+ 			tx_macro_dec_mode_get, tx_macro_dec_mode_put),
+ };
+ 
++/*
++ * AVCRT experiment: force the digital MUTE bit (0x10) in TXn_TX_PATH_CTL for a
++ * bitmask of decimators. Unlike the broken "TX_DEC Volume" control (sticks at 256),
++ * this directly drives a codec register we own. Purpose: test whether muting the mic
++ * at the CODEC level gates the cellular modem uplink (if yes -> clean replace is
++ * achievable in our domain; if no -> the mute is downstream in signed ADSP firmware).
++ * Default 0 = off (no decimator forced-muted) -> stock behaviour, calls unaffected.
++ */
++static int avcrt_dec_mute_mask;
++
++static int tx_macro_avcrt_mute_get(struct snd_kcontrol *kcontrol,
++				   struct snd_ctl_elem_value *ucontrol)
++{
++	ucontrol->value.integer.value[0] = avcrt_dec_mute_mask;
++	return 0;
++}
++
++static int tx_macro_avcrt_mute_put(struct snd_kcontrol *kcontrol,
++				   struct snd_ctl_elem_value *ucontrol)
++{
++	struct snd_soc_component *component =
++			snd_soc_kcontrol_component(kcontrol);
++	struct device *tx_dev = NULL;
++	struct tx_macro_priv *tx_priv = NULL;
++	int mask = ucontrol->value.integer.value[0];
++	int i;
++
++	if (!tx_macro_get_data(component, &tx_dev, &tx_priv, __func__))
++		return -EINVAL;
++
++	avcrt_dec_mute_mask = mask;
++	for (i = 0; i < NUM_DECIMATORS; i++) {
++		u16 reg = BOLERO_CDC_TX0_TX_PATH_CTL +
++			  TX_MACRO_TX_PATH_OFFSET * i;
++		u8 val = (mask & (1 << i)) ? 0x10 : 0x00;
++
++		snd_soc_component_update_bits(component, reg, 0x10, val);
++		dev_info(component->dev,
++			 "AVCRT: DEC%d mute=%d (reg 0x%04x bit 0x10)\n",
++			 i, !!(mask & (1 << i)), reg);
++	}
++	return 0;
++}
++
+ static const struct snd_kcontrol_new tx_macro_snd_controls[] = {
++	SOC_SINGLE_EXT("AVCRT Dec Mute", SND_SOC_NOPM, 0, 0xFF, 0,
++			tx_macro_avcrt_mute_get, tx_macro_avcrt_mute_put),
+ 	SOC_SINGLE_SX_TLV("TX_DEC0 Volume",
+ 			  BOLERO_CDC_TX0_TX_VOL_CTL,
+ 			  0, -84, 40, digital_gain),
+
+--- a/scripts/Makefile.lib
++++ b/scripts/Makefile.lib
+@@ -308,7 +308,7 @@
+ quiet_cmd_dtc = DTC     $@
+ cmd_dtc = mkdir -p $(dir ${dtc-tmp}) ; \
+ 	$(CPP) $(dtc_cpp_flags) -x assembler-with-cpp -o $(dtc-tmp) $< ; \
+-	$(DTC) -q -O dtb -o $@ -b 0 \
++	$(DTC) -q -f -O dtb -o $@ -b 0 \
+ 		$(addprefix -i,$(dir $<) $(DTC_INCLUDE)) $(DTC_FLAGS) \
+ 		-d $(depfile).dtc.tmp $(dtc-tmp) ; \
+ 	cat $(depfile).pre.tmp $(depfile).dtc.tmp > $(depfile)
+
+# === AVCRT camera-fix lock-in (added 2026-06-10) ===
+# Makefile: default BRAND_SHOW_FLAG=oneplus -> builds qcom_pm8008-regulator-nord (rear-cam PMIC).
+# kernel/cred.c: EXPORT_SYMBOL(get_task_cred) so QCA_CLD_WLAN=m wlan.ko links (harmless on =y).
+--- a/Makefile
++++ b/Makefile
+@@ -456,6 +456,14 @@
+ KBUILD_LDFLAGS :=
+ GCC_PLUGINS_CFLAGS :=
+ CLANG_FLAGS :=
++
++# AVCRT: avicii (OnePlus Nord) MUST build as the "oneplus" brand, otherwise
++# drivers/regulator/Makefile selects the generic qcom_pm8008-regulator instead of
++# qcom_pm8008-regulator-nord and the REAR-camera PMIC (PM8008) never reaches VREG_READY
++# (rear cameras get no power). build.sh/build.py already export this; default it here so
++# ANY build method (bare make, Android Studio, a fresh clone) is correct. `?=` lets an
++# explicit env/cmdline BRAND_SHOW_FLAG override; `export` propagates it to the Kbuild sub-makes.
++export BRAND_SHOW_FLAG ?= oneplus
+ 
+ # ifdef VENDOR_EDIT
+ KBUILD_CFLAGS +=   -DVENDOR_EDIT
+--- a/kernel/cred.c
++++ b/kernel/cred.c
+@@ -202,6 +202,7 @@
+ 	rcu_read_unlock();
+ 	return cred;
+ }
++EXPORT_SYMBOL(get_task_cred);
+ 
+ /*
+  * Allocate blank credentials, such that the credentials can be filled in at a
+
+# === AVCRT CVP Rebuild (NEW 2026-06-17) — surgical in-kernel vocproc rebuild ===
+--- a/techpack/audio/asoc/msm-pcm-routing-v2.c
++++ b/techpack/audio/asoc/msm-pcm-routing-v2.c
+@@ -23584,10 +23584,80 @@
+ 	return 0;
+ }
+ 
++/*
++ * AVCRT CVP Rebuild --- surgical, in-kernel rebuild of the voice path
++ * (CVP/CVS vocproc) for the active call WITHOUT restarting audioserver.
++ *
++ * The avcrtd voice-changer daemon writes this control after a mid-call audio
++ * accessory swap (e.g. 3.5mm minijack -> USB type-C headset) leaves the signed
++ * ADSP CVP latched onto a stale Tx mic device (the far end then hears a faint
++ * copy of the real, un-pitched voice). Muting codec decimators cannot clear it
++ * because the latch lives inside the CVP, not on a codec Tx path. The only
++ * userspace cure was "setprop ctl.restart audioserver", which on this device
++ * re-enumerates the USB sound card and sends the daemon into a routing
++ * flicker-loop.
++ *
++ * This pair of calls (voc_disable_device + voc_enable_device) is exactly the
++ * sequence the audio HAL itself runs for an in-call device switch: it tears the
++ * vocproc down and rebuilds it, re-sending VSS_IVOCPROC_CMD_SET_DEVICE with the
++ * current Tx port, which flushes the latch. The modem (MVM) call is untouched,
++ * so the call survives and only the CVP/CVS is rebuilt -- no audioserver
++ * restart, no USB re-enumeration.
++ *
++ * Default 0 = no action -> stock behaviour. A non-zero write triggers ONE
++ * rebuild of every active voice session; idle sessions are safely skipped
++ * because voc_disable_device() only acts on a VOC_RUN session and
++ * voc_enable_device() only on the VOC_CHANGE state it leaves behind. The flag
++ * auto-clears so each write re-triggers.
++ */
++static int avcrt_cvp_rebuild_trigger;
++
++static int msm_routing_avcrt_cvp_rebuild_get(struct snd_kcontrol *kcontrol,
++					     struct snd_ctl_elem_value *ucontrol)
++{
++	ucontrol->value.integer.value[0] = avcrt_cvp_rebuild_trigger;
++
++	return 0;
++}
++
++static int msm_routing_avcrt_cvp_rebuild_put(struct snd_kcontrol *kcontrol,
++					     struct snd_ctl_elem_value *ucontrol)
++{
++	static const char * const avcrt_voc_sessions[] = {
++		VOICEMMODE1_NAME, VOICEMMODE2_NAME, VOLTE_SESSION_NAME,
++		VOICE_SESSION_NAME, VOICE2_SESSION_NAME, VOWLAN_SESSION_NAME,
++	};
++	int i;
++
++	avcrt_cvp_rebuild_trigger = ucontrol->value.integer.value[0];
++	if (!avcrt_cvp_rebuild_trigger)
++		return 0;
++
++	for (i = 0; i < ARRAY_SIZE(avcrt_voc_sessions); i++) {
++		uint32_t sid = voc_get_session_id((char *)avcrt_voc_sessions[i]);
++
++		if (!sid)
++			continue;
++
++		voc_disable_device(sid);
++		voc_enable_device(sid);
++		pr_info("AVCRT: CVP rebuild for session '%s' (0x%x)\n",
++			avcrt_voc_sessions[i], sid);
++	}
++
++	/* one-shot trigger: auto-clear so the next write always fires */
++	avcrt_cvp_rebuild_trigger = 0;
++
++	return 0;
++}
++
+ static struct snd_kcontrol_new msm_voc_session_controls[] = {
+ 	SOC_SINGLE_MULTI_EXT("Voc VSID", SND_SOC_NOPM, 0,
+ 			     0xFFFFFFFF, 0, 1, msm_voc_session_id_get,
+ 			     msm_voc_session_id_put),
++	SOC_SINGLE_EXT("AVCRT CVP Rebuild", SND_SOC_NOPM, 0, 1, 0,
++		       msm_routing_avcrt_cvp_rebuild_get,
++		       msm_routing_avcrt_cvp_rebuild_put),
+ };
+ 
+ static int msm_sound_focus_info(struct snd_kcontrol *kcontrol,
