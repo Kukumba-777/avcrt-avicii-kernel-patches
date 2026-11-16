@@ -1,7 +1,7 @@
-# avcrt-txmacro.patch  —  AVCRT cellular (GSM/VoLTE) voice-change kernel change ONLY.
+# 0001-audio-bolero-decimator-mute.patch — AVCRT codec decimator mute control.
 # Adds the default-OFF "AVCRT Dec Mute" codec kcontrol (bitmask -> TXn_TX_PATH_CTL bit 0x10)
 # used by the avcrtd daemon to mute the call's modem-bound decimators for a clean voice replace.
-# Apply from the kernel source root:  patch -p1 < avcrt-txmacro.patch   (or: git apply)
+# Apply from kernel source root with git apply (after git apply --check).
 --- a/techpack/audio/asoc/codecs/bolero/tx-macro.c
 +++ b/techpack/audio/asoc/codecs/bolero/tx-macro.c
 @@ -2395,7 +2395,53 @@

@@ -1,95 +1,60 @@
-# Kernel Patches for OnePlus Nord (avicii / lito) — AVCRT & Build Fixes
+# OnePlus Nord 1 kernel patches (avicii / lito, vendor Linux 4.19)
 
-A collection of patches for the Linux 4.19 kernel targeting the **OnePlus Nord** (`avicii`, Qualcomm Snapdragon 765G / `lito` platform). These patches fix common kernel build issues and introduce kernel-level audio controls required by the **AVCRT** real-time voice changer daemon (`avcrtd`).
+Each patch has a single purpose. Overlapping combined patches have been removed
+to prevent duplicate application. The patch order is listed in `series`.
 
----
+## Patch contents
 
-## 📋 Patch Overview
+| File | Target | Purpose |
+|---|---|---|
+| `0001-audio-bolero-decimator-mute.patch` | `techpack/audio/asoc/codecs/bolero/tx-macro.c` | Adds `AVCRT Dec Mute`, a digital mute bitmask for Bolero decimators. AVCRT uses this to suppress the original microphone on compatible cellular routes. |
+| `0002-audio-voice-cvp-recovery.patch` | `techpack/audio/asoc/msm-pcm-routing-v2.c` | Adds `AVCRT CVP Rebuild`, a vocproc disable/enable request without restarting audioserver. Reads return 0; writing 1 requests recovery; writing 0 does nothing. Requests are serialized, and q6voice errors are logged and returned to userspace. |
+| `0003-avicii-oneplus-camera-pmic-selection.patch` | `Makefile` | Defaults `BRAND_SHOW_FLAG` to `oneplus` to select the OnePlus-specific PM8008 regulator. This is unrelated to voice processing. An explicit variable value can override the default. |
+| `0004-build-dtc-force-output.patch` | `scripts/Makefile.lib` | Adds DTC `-f` to emit DTB output despite validation errors. This is a build workaround, not a device-tree repair; the output requires validation. It is not required by the DSP itself. |
+| `0005-modules-export-get-task-cred.patch` | `kernel/cred.c` | Exports `get_task_cred` for external modules that reference this symbol, such as certain WLAN builds. AVCRT itself does not require this export. |
 
-This repository includes both a unified all-in-one patch and isolated modular patches:
+Control availability does not prove compatibility with every audio route. CVP
+recovery requires on-device testing: successful requests for idle sessions may
+be no-ops.
 
-| File | Description |
+## Current source tree
+
+All five changes are already present in the adjacent `NH-avcrt-avicii-kernel`
+source tree, including the newly added CVP control. **Do not reapply this series
+to that tree.** This is not a statement about the kernel running on a phone or
+the result of hardware testing.
+
+Do not build or flash automatically. The owner performs all builds and installation.
+
+## Checking and applying patches
+
+From the target kernel source root, inspect `git status` and `git diff` first.
+Preserve existing user changes. For each selected patch:
+
+```bash
+git apply --check ../avcrt-avicii-kernel-patches/0002-audio-voice-cvp-recovery.patch
+# Apply only if the changes are absent and the check succeeds:
+git apply ../avcrt-avicii-kernel-patches/0002-audio-voice-cvp-recovery.patch
+```
+
+If the forward check fails, a reverse check can determine whether this version
+of the change is already present. The following check does not revert anything:
+
+```bash
+git apply --reverse --check ../avcrt-avicii-kernel-patches/0002-audio-voice-cvp-recovery.patch
+```
+
+If both checks fail, investigate the diff and base version. Do not force application.
+
+## Legacy filename mapping
+
+| Previous file (removed or renamed) | Replacement |
 |---|---|
-| **`avcrt-kernel-unified.patch`** | **Recommended (All-in-One)**: Combines all changes (AVCRT audio kcontrols + essential kernel build & camera PMIC fixes). |
-| `avcrt-build-fixes.patch` | Build fixes only (rear camera PM8008 PMIC, DTC compiler flag, symbol export for external Wi-Fi drivers). |
-| `avcrt-txmacro.patch` | Audio kcontrol only (`AVCRT Dec Mute` for clean mic silencing on cellular calls). |
-| `avcrt-kernel.patch` | `AVCRT Dec Mute` + Device Tree compiler (DTC) build fix. |
+| `avcrt-txmacro.patch` | `0001` |
+| `avcrt-cvp-rebuild.patch` | `0002` |
+| `avcrt-kernel.patch` | `0001` + `0004` |
+| `avcrt-build-fixes.patch` | `0003` + `0004` + `0005` |
+| `avcrt-kernel-unified.patch` | `0001`–`0005`, without a duplicate combined patch |
 
----
-
-## 🛠 Detailed Component Breakdown
-
-### 1. Audio Subsystem for AVCRT (`techpack/audio`)
-* **`AVCRT Dec Mute`** (`techpack/audio/asoc/codecs/bolero/tx-macro.c`):
-  * Exposes an ALSA mixer control (`AVCRT Dec Mute`) taking a bitmask of TX decimators.
-  * Directly forces the digital MUTE bit (`0x10`) in `BOLERO_CDC_TXn_TX_PATH_CTL`.
-  * Allows the `avcrtd` daemon to mute modem-bound decimators at the codec level during cellular calls (GSM/VoLTE). This ensures the far end hears only the pitch-shifted audio injected via `incall_music` without the original voice leaking through. Default is `0` (off, stock behavior).
-* **`AVCRT CVP Rebuild`** (`techpack/audio/asoc/msm-pcm-routing-v2.c`):
-  * Provides surgical in-kernel vocproc teardown and rebuild (`voc_disable_device()` + `voc_enable_device()`) across active voice sessions without restarting `audioserver`.
-  * Fixes the ADSP CVP latch bug when swapping audio accessories mid-call (e.g., 3.5mm analog jack to USB Type-C), avoiding USB soundcard re-enumeration flicker loops. Trigger auto-clears on write.
-
-### 2. Kernel Build Fixes
-* **Rear Camera PMIC Fix (`Makefile`)**:
-  * Sets `export BRAND_SHOW_FLAG ?= oneplus`, forcing the build system to select `qcom_pm8008-regulator-nord` instead of the generic regulator driver. Without this, the PM8008 camera PMIC never reaches `VREG_READY` and rear cameras receive no power (black screen).
-* **Device Tree Compiler Fix (`scripts/Makefile.lib`)**:
-  * Appends `-f` to `cmd_dtc` so strict DTC checks do not fail on `lito-mtp-overlay.dtbo`. Enables successful compilation of `dtbs` and `Image.gz-dtb` targets.
-* **External Wi-Fi Module Support (`kernel/cred.c`)**:
-  * Adds `EXPORT_SYMBOL(get_task_cred)`, required for linking external out-of-tree `wlan.ko` drivers (such as NetHunter monitor mode / frame injection drivers). Harmless when WLAN driver is built-in (`=y`).
-
----
-
-## 🚀 How to Apply
-
-Navigate to the root directory of your kernel source tree:
-
-```bash
-cd /path/to/kernel/source
-```
-
-### Method 1: Using `git apply` (Recommended)
-
-Check if the patch applies cleanly (dry run):
-```bash
-git apply --check /path/to/patches/avcrt-kernel-unified.patch
-```
-
-Apply the patch:
-```bash
-git apply /path/to/patches/avcrt-kernel-unified.patch
-```
-
-> **Tip:** To revert the patch:
-> ```bash
-> git apply -R /path/to/patches/avcrt-kernel-unified.patch
-> ```
-
----
-
-### Method 2: Using standard `patch`
-
-Apply:
-```bash
-patch -p1 < /path/to/patches/avcrt-kernel-unified.patch
-```
-
-Revert:
-```bash
-patch -p1 -R < /path/to/patches/avcrt-kernel-unified.patch
-```
-
----
-
-## ⚙️ Mixer Controls Usage (On-Device)
-
-Once the patched kernel is running, controls can be queried and set via root shell / ADB:
-
-```bash
-# Check current decimator mute mask
-tinymix "AVCRT Dec Mute"
-
-# Force-mute specific decimators (bitmask example)
-tinymix "AVCRT Dec Mute" 1
-
-# Trigger mid-call CVP vocproc rebuild (auto-clears to 0)
-tinymix "AVCRT CVP Rebuild" 1
-```
+Use this mapping when reading older documents. Apply only missing changes, not
+an old overlapping bundle on top of the new series.
